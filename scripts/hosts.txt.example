@@ -1,0 +1,8 @@
+# 集群节点内网 IP 列表
+# 每行一个 IP，第一行是主节点 (node_rank=0)
+# 复制为 hosts.txt 后填入你的实际 EC2 内网 IP
+#
+# 查看本机内网 IP: hostname -I  或  ip -o -4 addr show ens5
+#
+# 172.31.10.1
+# 172.31.10.2
