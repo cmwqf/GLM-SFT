@@ -1,0 +1,218 @@
+--- transformer_impl.py.orig	2026-07-01 19:23:03.034982829 +0000
++++ transformer_impl.py	2026-07-01 19:18:37.357528357 +0000
+@@ -166,6 +166,12 @@
+         )
+ 
+     @property
++    def _use_dcp_load(self) -> bool:
++        """Enable the DCP sharded-load path when VERL_DCP_CKPT_PATH points to a DCP
++        checkpoint produced by scripts/convert_hf_to_dcp.py. Only meaningful for FSDP2."""
++        return bool(os.environ.get("VERL_DCP_CKPT_PATH", "").strip())
++
++    @property
+     def is_param_offload_enabled(self) -> bool:
+         return self._is_offload_param
+ 
+@@ -239,6 +245,37 @@
+ 
+         torch_dtype = PrecisionType.to_dtype(torch_dtype)
+ 
++        # ---------------------------------------------------------------------------
++        # DCP sharded-load path (env VERL_DCP_CKPT_PATH set): ALL ranks build the model
++        # on the meta device — no weights are materialized here. Real weights are streamed
++        # per-rank straight into the FSDP2-sharded params during _build_fsdp_module via
++        # torch.distributed.checkpoint.load. Peak per-rank memory ~ model_size / world_size,
++        # with no rank0 full-load and no sync_module_states broadcast. This is the only path
++        # that scales past a single node for large (esp. MoE) models. See scripts/README.
++        # ---------------------------------------------------------------------------
++        if self._use_dcp_load:
++            assert self.model_config.model_type == "language_model", (
++                "VERL_DCP_CKPT_PATH sharded load only supports language_model"
++            )
++            assert not self._is_lora and not self._qat_enabled, (
++                "VERL_DCP_CKPT_PATH sharded load does not support LoRA/QAT yet"
++            )
++            from accelerate import init_empty_weights
++
++            with init_empty_weights(), warnings.catch_warnings():
++                warnings.simplefilter("ignore")
++                auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
++                if self.rank == 0:
++                    print(f"[DCP] all ranks meta-init model (weights loaded later from "
++                          f"{os.environ['VERL_DCP_CKPT_PATH']})")
++                module = auto_class.from_config(
++                    config=self.model_config.hf_config,
++                    torch_dtype=torch_dtype,
++                    trust_remote_code=self.model_config.trust_remote_code,
++                )
++                module = self._apply_module_patches(module, torch_dtype)
++            return module
++
+         init_context = get_init_weight_context_manager(
+             use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
+         )
+@@ -250,7 +287,8 @@
+                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
+ 
+                 # Only rank 0 loads weights; other ranks create empty model
+-                _is_src_rank = (self.device_mesh is None and torch.distributed.get_rank() == 0) or                                (self.device_mesh is not None and self.device_mesh.get_coordinate()[-1] == 0)
++                _is_src_rank = (self.device_mesh is None and torch.distributed.get_rank() == 0) or \
++                               (self.device_mesh is not None and self.device_mesh.get_coordinate()[-1] == 0)
+                 if _is_src_rank:
+                     module = auto_class.from_pretrained(
+                         pretrained_model_name_or_path=self.model_config.local_path,
+@@ -283,36 +321,42 @@
+                     low_cpu_mem_usage=True,
+                 )
+ 
+-            use_liger = self.model_config.use_liger
+-            # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
+-            if use_liger:
+-                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+-
+-                _apply_liger_kernel_to_instance(
+-                    model=module,
+-                    fused_linear_cross_entropy=False,
+-                    swiglu=True,
+-                )
++            module = self._apply_module_patches(module, torch_dtype)
++        return module
+ 
+-            fused_kernel_options = self.model_config.fused_kernel_options
+-            fused_kernels_backend = (
+-                fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
+-            )
++    def _apply_module_patches(self, module, torch_dtype):
++        """Liger kernel, verl monkey patches, dtype cast and gradient checkpointing.
++        Safe to run on a meta-device module (dtype cast / grad-ckpt keep params on meta)."""
++        use_liger = self.model_config.use_liger
++        # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
++        if use_liger:
++            from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+ 
+-            use_fused_kernels = self.model_config.use_fused_kernels
+-            apply_monkey_patch(
++            _apply_liger_kernel_to_instance(
+                 model=module,
+-                use_remove_padding=self.use_remove_padding,
+-                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+-                use_fused_kernels=use_fused_kernels,
+-                fused_kernels_backend=fused_kernels_backend,
++                fused_linear_cross_entropy=False,
++                swiglu=True,
+             )
+ 
+-            # some parameters may not in torch_dtype
+-            module.to(torch_dtype)
++        fused_kernel_options = self.model_config.fused_kernel_options
++        fused_kernels_backend = (
++            fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
++        )
++
++        use_fused_kernels = self.model_config.use_fused_kernels
++        apply_monkey_patch(
++            model=module,
++            use_remove_padding=self.use_remove_padding,
++            ulysses_sp_size=self.ulysses_sequence_parallel_size,
++            use_fused_kernels=use_fused_kernels,
++            fused_kernels_backend=fused_kernels_backend,
++        )
+ 
+-            if self.model_config.enable_gradient_checkpointing:
+-                module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
++        # some parameters may not in torch_dtype
++        module.to(torch_dtype)
++
++        if self.model_config.enable_gradient_checkpointing:
++            module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+         return module
+ 
+     def _build_lora_module(self, module):
+@@ -386,7 +430,12 @@
+         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)
+ 
+         # Note: We force turn off CPUOffload because it causes incorrect results when using grad accumulation
+-        if self.engine_config.strategy == "fsdp":
++        if self._use_dcp_load:
++            # DCP sharded-load path: model is on meta (all ranks). Wrap with FSDP2 fully_shard,
++            # materialize local shards, then stream each rank's shard directly from the DCP
++            # checkpoint. No full model on any rank, no rank0 broadcast. Forces FSDP2.
++            module = self._build_fsdp_module_dcp(module, param_dtype, reduce_dtype)
++        elif self.engine_config.strategy == "fsdp":
+             # cpu_offload:
+             # - actor: None
+             # - critic: None
+@@ -459,6 +508,55 @@
+ 
+         return module
+ 
++    def _build_fsdp_module_dcp(self, module, param_dtype, reduce_dtype):
++        """FSDP2 fully_shard on a meta module, then stream weights per-rank from a DCP
++        checkpoint (torch.distributed.checkpoint). Peak per-rank memory ~ model/world_size:
++        no rank holds the full model, no rank0->all broadcast. Produces an FSDP2 module.
++
++        The DCP checkpoint (scripts/convert_hf_to_dcp.py) is keyed by the model's *fused*
++        param names and also carries the (few, tiny) non-persistent buffers (rotary
++        inv_freq), so nothing needs recomputation on the training side.
++        """
++        import torch.distributed.checkpoint as dcp
++        from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
++
++        ckpt_path = os.environ["VERL_DCP_CKPT_PATH"].strip()
++
++        offload_policy = None
++        if self.engine_config.offload_policy or self.engine_config.forward_only:
++            self._is_offload_param = False
++            self._is_offload_optimizer = False
++            offload_policy = CPUOffloadPolicy(pin_memory=True)
++            self._uses_fsdp2_cpu_offload_policy = True
++
++        mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
++        fsdp_kwargs = {
++            "mesh": self.device_mesh,
++            "mp_policy": mp_policy,
++            "offload_policy": offload_policy,
++            "reshard_after_forward": self.engine_config.reshard_after_forward,
++        }
++
++        # 1) shard the meta model -> params become DTensors (still meta)
++        apply_fsdp2(module, fsdp_kwargs, self.engine_config)
++
++        # 2) materialize each rank's LOCAL shard (empty storage), incl. buffers
++        module.to_empty(device=get_device_id())
++
++        # 3) stream weights: DCP reads only each rank's shard and reshards from the
++        #    single-process (world_size-agnostic) checkpoint into the local DTensors.
++        msd = get_model_state_dict(module)  # params + persistent buffers (sharded DTensors)
++        extra_buffers = {n: b for n, b in module.named_buffers() if n not in msd}  # non-persistent
++        if self.rank == 0:
++            print(f"[DCP] loading sharded checkpoint from {ckpt_path} "
++                  f"({len(msd)} sharded tensors + {len(extra_buffers)} buffers)", flush=True)
++        dcp.load({**msd, **extra_buffers}, checkpoint_id=ckpt_path)  # in-place fill (extra are model refs)
++        set_model_state_dict(module, msd)  # write back model-managed (sharded) tensors
++        torch.distributed.barrier()
++        log_gpu_memory_usage("After DCP sharded load", logger=logger)
++
++        return module
++
+     def _build_optimizer(self, module):
+         from verl.workers.config.optimizer import build_optimizer
+ 
+@@ -554,7 +652,7 @@
+     def _build_model_optimizer(self):
+         from verl.utils.model import print_model_size
+ 
+-        # Load base model with specified configuration and dtype
++        # Build model on meta device (no weights loaded yet)
+         module = self._build_module()
+         # Apply LoRA adapters if low-rank adaptation is enabled
+         if self._is_lora:
+@@ -568,7 +666,7 @@
+         torch.distributed.barrier()
+         if self.rank == 0:
+             print_model_size(module)
+-        log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
++        log_gpu_memory_usage("After meta-init model (no weights loaded yet)", logger=logger)
+ 
+         # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
+         log_gpu_memory_usage("Before FSDP", logger=None)
